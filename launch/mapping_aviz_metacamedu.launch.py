@@ -8,6 +8,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 def generate_launch_description():
     
@@ -43,7 +44,12 @@ def generate_launch_description():
         'use_respawn', 
         default_value='True',
         description='Whether to respawn if a node crashes. Applied when composition is disabled.')
-
+    
+    qos_profile = QoSProfile(
+        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=10
+    )
     avia_params_file = LaunchConfiguration('avia_params_file')
     camera_params_file = LaunchConfiguration('camera_params_file')
     use_respawn = LaunchConfiguration('use_respawn')

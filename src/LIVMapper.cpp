@@ -68,6 +68,7 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   };
 
   // declare parameter
+
   try_declare.template operator()<std::string>("common.lid_topic", "/livox/lidar");
   try_declare.template operator()<std::string>("common.imu_topic", "/livox/imu");
   try_declare.template operator()<bool>("common.ros_driver_bug_fix", false);
@@ -124,6 +125,23 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   try_declare.template operator()<int>("publish.pub_scan_num", 1);
   try_declare.template operator()<bool>("publish.pub_effect_point_en", false);
   try_declare.template operator()<bool>("publish.dense_map_en", false);
+
+  // performance parameters __ NEW__
+  try_declare.template operator()<bool>("performance.frame_dropping_enabled", true);
+  try_declare.template operator()<double>("performance.max_processing_time_ms", 80.0);
+  try_declare.template operator()<int>("performance.max_lidar_buffer_size",5);
+  try_declare.template operator()<int>("performance.max_imu_buffer_size", 50);
+  try_declare.template operator()<int>("performance.max_img_buffer_size", 5);
+  
+  this->node->get_parameter("performance.frame_dropping_enable", frame_dropping_enabled);
+  this->node->get_parameter("performance.max_processing_time_ms", max_processing_time_ms);
+  this->node->get_parameter("performance.max_lidar_buffer_size", max_lidar_buffer_size);
+  this->node->get_parameter("performance.max_imu_buffer_size", max_imu_buffer_size);
+  this->node->get_parameter("performance.max_img_buffer_size", max_img_buffer_size);
+
+
+  //New code end
+
 
   // get parameter
   this->node->get_parameter("common.lid_topic", lid_topic);
@@ -437,6 +455,9 @@ void LIVMapper::stateEstimationAndMapping()
 
 void LIVMapper::handleVIO() 
 {
+  lio_processing_flag.store(true);
+  last_lio_start_time = std::chrono::steady_clock::now();
+
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
@@ -488,10 +509,17 @@ void LIVMapper::handleVIO()
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
-}
+
+  lio_processing_flag.store(false);
+  }
 
 void LIVMapper::handleLIO() 
 {    
+
+  // Set processing flag and record start time
+  lio_processing_flag.store(true);
+  last_lio_start_time = std::chrono::steady_clock::now();
+  
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
            << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
@@ -636,7 +664,11 @@ void LIVMapper::handleLIO()
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
-}
+
+  // Clear processing flag when done
+  lio_processing_flag.store(false);
+
+          }
 
 void LIVMapper::savePCD() 
 {
@@ -694,6 +726,14 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
   while (rclcpp::ok()) 
   {
     rclcpp::spin_some(this->node);
+
+    // Check for processing overload and trim buffers if needed
+    if (isProcessingOverloaded()) {
+      trimBuffers();
+      rate.sleep();
+      continue;
+    }
+
     if (!sync_packages(LidarMeasures)) 
     {
       rate.sleep();
@@ -849,6 +889,12 @@ void LIVMapper::RGBpointBodyToWorld(PointType const *const pi, PointType *const 
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
 {
   if (!lidar_en) return;
+
+   if (isProcessingOverloaded()) {
+    RCLCPP_WARN(node->get_logger(), "Dropping LiDAR frame - processing overloaded");
+    return;
+  }
+
   mtx_buffer.lock();
 
   double cur_head_time = stamp2Sec(msg->header.stamp) + lidar_time_offset;
@@ -857,15 +903,24 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShare
   {
     RCLCPP_ERROR(this->node->get_logger(),"lidar loop back, clear buffer");
     lid_raw_data_buffer.clear();
+    lid_header_time_buffer.clear();
   }
   // ROS_INFO("get point cloud at time: %.6f", stamp2Sec(msg->header.stamp));
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  if (!ptr || ptr->empty()) {
+    mtx_buffer.unlock();
+    return;
+  }
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
 
   mtx_buffer.unlock();
+
+  // Trim buffers after adding new data
+  trimBuffers();
+
   sig_buffer.notify_all();
 }
 
@@ -915,6 +970,11 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstShar
 void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
   if (!imu_en) return;
+  if (last_timestamp_lidar < 0.0) return;
+  if (isProcessingOverloaded()) {
+    RCLCPP_WARN(node->get_logger(), "Dropping IMU frame - processing overloaded");
+    return;
+  }
 
   if (last_timestamp_lidar < 0.0) return;
   RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f", stamp2Sec(msg_in->header.stamp));
@@ -1006,7 +1066,6 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
   }
 
   mtx_buffer.lock();
-
   double img_time_correct = msg_header_time; // last_timestamp_lidar + 0.105;
 
   if (img_time_correct - last_timestamp_img < 0.02)
@@ -1016,19 +1075,30 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
     sig_buffer.notify_all();
     return;
   }
-
   cv::Mat img_cur = getImageFromMsg(msg);
   img_buffer.push_back(img_cur);
   img_time_buffer.push_back(img_time_correct);
-
-  // ROS_INFO("Correct Image time: %.6f", img_time_correct);
-
   last_timestamp_img = img_time_correct;
-  // cv::imshow("img", img);
-  // cv::waitKey(1);
-  // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
   mtx_buffer.unlock();
+  
+  // Trim buffers after adding new data
+  trimBuffers();
+  
   sig_buffer.notify_all();
+  
+
+  // cv::Mat img_cur = getImageFromMsg(msg);
+  // img_buffer.push_back(img_cur);
+  // img_time_buffer.push_back(img_time_correct);
+
+  // // ROS_INFO("Correct Image time: %.6f", img_time_correct);
+
+  // last_timestamp_img = img_time_correct;
+  // // cv::imshow("img", img);
+  // // cv::waitKey(1);
+  // // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
+  // mtx_buffer.unlock();
+  // sig_buffer.notify_all();
 }
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
@@ -1471,4 +1541,57 @@ void LIVMapper::publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::Share
   msg_body_pose.header.frame_id = "camera_init";
   path.poses.push_back(msg_body_pose);
   pubPath->publish(path);
+}
+bool LIVMapper::isProcessingOverloaded()
+{
+  if (!frame_dropping_enabled) return false;
+  
+  auto now = std::chrono::steady_clock::now();
+  
+  // Check if LIO is taking too long
+  if (lio_processing_flag.load()) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_lio_start_time);
+    if (elapsed.count() > max_processing_time_ms) {
+      return true;
+    }
+  }
+  
+  // Check if VIO is taking too long
+  if (vio_processing_flag.load()) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_vio_start_time);
+    if (elapsed.count() > max_processing_time_ms) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+void LIVMapper::trimBuffers()
+{
+  if (!frame_dropping_enabled) return;
+  
+  mtx_buffer.lock();
+  
+  // Trim LiDAR buffer
+  while (lid_raw_data_buffer.size() > max_lidar_buffer_size) {
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
+    RCLCPP_WARN(node->get_logger(), "Dropped LiDAR frame due to buffer overflow");
+  }
+  
+  // Trim IMU buffer
+  while (imu_buffer.size() > max_imu_buffer_size) {
+    imu_buffer.pop_front();
+    RCLCPP_WARN(node->get_logger(), "Dropped IMU message due to buffer overflow");
+  }
+  
+  // Trim image buffer
+  while (img_buffer.size() > max_img_buffer_size) {
+    img_buffer.pop_front();
+    img_time_buffer.pop_front();
+    RCLCPP_WARN(node->get_logger(), "Dropped image frame due to buffer overflow");
+  }
+  
+  mtx_buffer.unlock();
 }

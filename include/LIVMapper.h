@@ -16,7 +16,7 @@ which is included as part of this source code package.
 #include "IMU_Processing.h"
 #include "vio.h"
 #include "preprocess.h"
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <image_transport/image_transport.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -25,6 +25,22 @@ which is included as part of this source code package.
 
 class LIVMapper
 {
+private:
+  // ...existing code...
+  
+  // Add these new members
+  std::atomic<bool> lio_processing_flag{false};
+  std::atomic<bool> vio_processing_flag{false};
+  std::chrono::steady_clock::time_point last_lio_start_time;
+  std::chrono::steady_clock::time_point last_vio_start_time;
+  
+  // Configuration from yaml
+  bool frame_dropping_enabled = true;
+  double max_processing_time_ms = 80.0;
+  int max_lidar_buffer_size = 5;
+  int max_imu_buffer_size = 50;
+  int max_img_buffer_size = 5;
+  
 public:
   LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
   ~LIVMapper();
@@ -39,7 +55,9 @@ public:
   void handleLIO();
   void savePCD();
   void processImu();
-  
+  bool isProcessingOverloaded();
+  void trimBuffers();
+
   bool sync_packages(LidarMeasureGroup &meas);
   void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr);
   void imu_prop_callback();

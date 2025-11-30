@@ -1,8 +1,8 @@
 /**:
   ros__parameters:
     common:
-      img_topic: "/left_camera/image"
-      lid_topic: "/livox/lidar"
+      img_topic: "/camera/image_raw/compressed" #"/left_camera/image"
+      lid_topic: "/livox/points" #"/livox/lidar"
       imu_topic: "/livox/imu"
       img_en: 1
       lidar_en: 1
